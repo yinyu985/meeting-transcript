@@ -10,7 +10,15 @@ const cfg = {
   hangoverMs: 700,
   prerollMs: 300,
   minMs: 300,
-  maxMs: 20000,
+  pauseCutMs: 240,
+  segmentFloorMs: 2000,
+  pauseRelaxAtMs: 10000,
+  pauseRelaxMs: 200,
+  pauseLateAtMs: 20000,
+  pauseLateMs: 160,
+  pauseLevelRatio: 0.03,
+  pauseLevelCap: 2.5,
+  pausePeakDecay: 0.995,
   paragraphGapMs: 1800,
   paragraphMaxMs: 60000,
 };
@@ -22,7 +30,7 @@ const el = {
   record: document.getElementById("record"),
   stateText: document.getElementById("stateText"),
   clock: document.getElementById("clock"),
-  pressure: document.querySelector("#pressure i"),
+  meters: [...document.querySelectorAll(".audio-meter")],
   copy: document.getElementById("copy"),
   clearWrap: document.getElementById("clearWrap"),
   jump: document.getElementById("jump"),
@@ -49,13 +57,15 @@ const state = {
   channels: new Map(), // 'mic' | 'remote' -> channel
   startedAt: 0,
   tick: null,
-  chain: Promise.resolve(),
+  chains: { mic: Promise.resolve(), remote: Promise.resolve() },
+  activeRequests: 0,
+  requestWaiters: [],
   generation: 0,
   sessionId: null,
   pending: 0,
   pendingMs: 0,
   samples: [],
-  segmentMs: 20000,
+  rtf: 0,
   overload: false,
   stick: true,
   micEnabled: true,
@@ -235,6 +245,7 @@ function createChannel(id, stream) {
     above: 0,
     below: 0,
     noise: 0.003,
+    speechPeak: 0,
     segAt: 0,
     level: 0,
     origin: 0,
@@ -242,9 +253,7 @@ function createChannel(id, stream) {
     group: null,
     groupAt: 0,
     lastVoiceEnd: -Infinity,
-    continuing: false,
-    heardAt: 0,
-    silentWarned: false,
+    levelAt: 0,
   };
 }
 
@@ -278,7 +287,8 @@ async function attachChannel(ctx, id, stream) {
 function requestAppAudio() {
   return navigator.mediaDevices.getDisplayMedia({
     video: { displaySurface: "window", frameRate: { ideal: 1, max: 2 } },
-    audio: true,
+    // 应用原声不做麦克风回声消除或降噪；实际是否采用以 getSettings() 为准。
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     windowAudio: "window",
     systemAudio: "include",
     selfBrowserSurface: "exclude",
@@ -292,7 +302,7 @@ function requestMicAudio() {
   });
 }
 
-// 客户端诊断：共享授权、音轨状态、静音通道、转写结果都进服务端同一份日志。
+// 客户端诊断：共享授权、音轨状态和会话起止。
 function clientLog(event, data = {}) {
   try {
     const body = JSON.stringify({ event, ...data });
@@ -302,16 +312,25 @@ function clientLog(event, data = {}) {
   } catch {}
 }
 
-// 录音中某一路连续无声音时提醒一次；静音的音轨不会报错，只会一直没字。
-const SILENT_FRAMES_MS = 15000;
-function watchSilence(ch) {
-  if (!state.recording || ch.silentWarned) return;
-  if (ch.elapsed - (ch.heardAt ?? 0) < SILENT_FRAMES_MS) return;
-  ch.silentWarned = true;
-  const which = ch.id === "mic" ? "麦克风" : "应用";
-  clientLog("channel.silent", { channel: ch.id, elapsedMs: Math.round(ch.elapsed) });
-  toast(`${which}那一路已经 ${Math.round(ch.elapsed / 1000)} 秒没有声音。若共享的是窗口，确认声音就是那个窗口在放。`, true);
+// 独立显示两路实际 RMS 电平，低于 -60 dBFS 归零；不把静音当故障。
+function meterReading(ch, recording, now) {
+  if (!recording || !ch) return { value: 0, text: recording ? "未开启" : "待机" };
+  if (!ch.levelAt || now - ch.levelAt > 500) return { value: 0, text: "无数据" };
+  const db = 20 * Math.log10(Math.max(ch.level, 1e-9));
+  return { value: Math.max(0, Math.min(100, (db + 60) / 60 * 100)),
+    text: db <= -60 ? "≤−60 dBFS" : `${Math.round(db)} dBFS` };
 }
+function updateMeters() {
+  for (const meter of el.meters) {
+    const reading = meterReading(state.channels.get(meter.dataset.channel), state.recording, Date.now());
+    meter.querySelector("i").style.transform = `scaleX(${reading.value / 100})`;
+    meter.querySelector("output").textContent = reading.text;
+    const bar = meter.querySelector('[role="meter"]');
+    bar.setAttribute("aria-valuenow", String(Math.round(reading.value)));
+    bar.setAttribute("aria-valuetext", reading.text);
+  }
+}
+setInterval(updateMeters, 100);
 
 function onFrame(ch, frame) {
   if (!ch.origin) ch.origin = Date.now() - FRAME_MS;
@@ -319,12 +338,7 @@ function onFrame(ch, frame) {
   const now = ch.origin + ch.elapsed;
   const level = rms(frame);
   ch.level = level;
-  if (level > 0.004) ch.heardAt = ch.elapsed;
-  else watchSilence(ch);
-
-  let maxLevel = 0;
-  state.channels.forEach((c) => (maxLevel = Math.max(maxLevel, c.level)));
-  el.pressure.style.transform = `scaleX(${Math.min(1, maxLevel * 14)})`;
+  ch.levelAt = Date.now();
 
   const thr = Math.max(0.006, ch.noise * 2.5);
 
@@ -351,32 +365,32 @@ function onFrame(ch, frame) {
   }
 
   ch.frames.push(frame);
-  ch.below = level < thr ? ch.below + 1 : 0;
-  if (level >= thr) ch.lastVoiceEnd = now;
+  // 停顿不必接近绝对零：结合近期讲话峰值，识别有底噪的低音量区间。
+  // 不改变开口门槛；相对门槛最多为原门槛的 2.5 倍，且不裁掉检测帧。
+  ch.speechPeak = Math.max(level, ch.speechPeak * cfg.pausePeakDecay);
+  const pauseThreshold = Math.max(thr, Math.min(thr * cfg.pauseLevelCap, ch.speechPeak * cfg.pauseLevelRatio));
+  ch.below = level < pauseThreshold ? ch.below + 1 : 0;
+  if (level >= pauseThreshold) ch.lastVoiceEnd = now;
   const ms = ch.frames.reduce((n, f) => n + f.length, 0) / RATE * 1000;
-  if (ch.below * FRAME_MS >= cfg.hangoverMs) flush(ch, ms, "silence");
-  else if (ms >= (state.segmentMs || cfg.maxMs)) flush(ch, ms, "limit");
+  // 时长只改变停顿要求，绝不直接触发切片；能量停顿不等于语义句界。
+  const requiredPause = ms >= cfg.pauseLateAtMs ? cfg.pauseLateMs :
+    ms >= cfg.pauseRelaxAtMs ? cfg.pauseRelaxMs : cfg.pauseCutMs;
+  const pause = ch.below * FRAME_MS;
+  if (pause >= cfg.hangoverMs) flush(ch, ms, "silence");
+  else if (ms >= cfg.segmentFloorMs && pause >= requiredPause) flush(ch, ms, "pause");
 }
 
 function flush(ch, ms, reason = "stop") {
   const captured = ch.frames;
   if (!captured.length) return;
+  // 连同检测到的停顿一并提交，不裁掉任何可能包含弱尾音的帧。
   const at = ch.segAt;
   const end = at + ms;
-  const meta = { group: ch.group, end, reason, continuation: ch.continuing };
+  const meta = { group: ch.group, end, reason };
   ch.frames = [];
-  ch.inSpeech = reason === "limit";
-  ch.continuing = reason === "limit";
-  ch.above = 0;
-  if (reason === "limit") {
-    // 下一帧直接接续，不重新等待开口，不遗漏切点附近的声音。
-    ch.segAt = end;
-    if (end - ch.groupAt >= cfg.paragraphMaxMs) {
-      ch.group = crypto.randomUUID();
-      ch.groupAt = end;
-    }
-  } else ch.below = 0;
-  if (ms < cfg.minMs && !meta.continuation && reason !== "stop") return;
+  ch.inSpeech = false;
+  ch.above = ch.below = 0;
+  if (ms < cfg.minMs && reason !== "stop") return;
   send(encodeWav(captured), at, ms, ch.id, meta);
 }
 
@@ -388,20 +402,17 @@ function updateProcessingStatus() {
   } else {
     el.stateText.textContent = `录音中${state.channels.size ? "" : " · 无输入"}${backlog}`;
   }
-  el.stateText.title = `切片上限 ${state.segmentMs / 1000} 秒；待转写包含当前请求，不是预计等待时间`;
+  el.stateText.title = "停顿切片：2 秒后寻找 240ms 停顿，10 秒后 200ms，20 秒后 160ms，此后不再缩短；无停顿不强切。少量请求依次处理，积压时两路可同时转写；待转写不是预计等待时间";
 }
 
 function observePerformance(durationMs, elapsedMs) {
   state.samples.push({ durationMs, elapsedMs });
   if (state.samples.length > 16) state.samples.shift();
-  // 初次请求可能冷启动；至少四次请求后才调整，且不持久化旧机器/模型数据。
+  // 只记录实际 RTF 供状态栏与日志使用；切片位置由停顿决定，不再按耗时改窗口。
   if (state.samples.length < 4) return;
   const recent = state.samples.slice(1);
-  const rtf = recent.reduce((n, s) => n + s.elapsedMs, 0) /
+  state.rtf = recent.reduce((n, s) => n + s.elapsedMs, 0) /
     recent.reduce((n, s) => n + s.durationMs, 0);
-  // 仅在明显有余量时降低延迟；双路留足余量，积压时回到保守上限。
-  const target = state.pendingMs > 30000 || rtf > 0.35 ? 20000 : rtf < 0.15 ? 8000 : 12000;
-  state.segmentMs = Math.max(target, state.segmentMs - 4000);
 }
 
 // ---------- 发送 ----------
@@ -423,7 +434,9 @@ function send(blob, at, dur, chanId, meta = {}) {
     });
   }
   console.info("audio.segment", { id, chanId, at, dur, ...meta });
-  state.chain = state.chain.then(async () => {
+  // 同一路依次完成；是否同时发送两路由请求槽控制。
+  const task = state.chains[chanId].then(async () => {
+    await acquireRequestSlot();
     const began = performance.now();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 120000);
@@ -459,10 +472,32 @@ function send(blob, at, dur, chanId, meta = {}) {
       clearTimeout(timeout);
       state.pending--;
       state.pendingMs = Math.max(0, state.pendingMs - dur);
+      state.activeRequests--;
+      pumpRequestSlots();
       updateProcessingStatus();
       console.info("audio.segment.done", { id, elapsedMs: performance.now() - began, queueMs: began - queued });
     }
   });
+  state.chains[chanId] = task;
+  // 新积压可以唤醒另一输入，不必等当前请求结束。
+  pumpRequestSlots();
+  return task;
+}
+
+function acquireRequestSlot() {
+  return new Promise(resolve => {
+    state.requestWaiters.push(resolve);
+    pumpRequestSlots();
+  });
+}
+
+function pumpRequestSlots() {
+  // 一次只有一两段时避免争用；至少三段待处理时提高吞吐，上限仍为两路。
+  const limit = state.pending >= 3 ? 2 : 1;
+  while (state.activeRequests < limit && state.requestWaiters.length) {
+    state.activeRequests++;
+    state.requestWaiters.shift()();
+  }
 }
 
 // ---------- 生命周期 ----------
@@ -553,7 +588,7 @@ async function stop() {
   el.record.lastChild.textContent = "开始";
   updateProcessingStatus();
   el.clock.textContent = "00:00";
-  el.pressure.style.transform = "scaleX(0)";
+  updateMeters();
   document.querySelectorAll(".caret").forEach((n) => n.remove());
   el.empty.style.display = state.lines.length ? "none" : "";
   state.stopping = false;
