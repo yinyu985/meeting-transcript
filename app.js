@@ -243,10 +243,19 @@ function createChannel(id, stream) {
     groupAt: 0,
     lastVoiceEnd: -Infinity,
     continuing: false,
+    heardAt: 0,
+    silentWarned: false,
   };
 }
 
 async function attachChannel(ctx, id, stream) {
+  const audio = stream.getAudioTracks()[0];
+  clientLog("channel.attach", {
+    channel: id,
+    tracks: stream.getTracks().map(t => `${t.kind}:${t.readyState}:${t.muted}`),
+    label: audio?.label || "",
+    settings: audio?.getSettings?.() || {},
+  });
   const src = ctx.createMediaStreamSource(stream);
   const node = new AudioWorkletNode(ctx, "recorder");
   const ch = createChannel(id, stream);
@@ -283,12 +292,35 @@ function requestMicAudio() {
   });
 }
 
+// 客户端诊断：共享授权、音轨状态、静音通道、转写结果都进服务端同一份日志。
+function clientLog(event, data = {}) {
+  try {
+    const body = JSON.stringify({ event, ...data });
+    console.info("client.log", event, data);
+    fetch("/api/log", { method: "POST", headers: { "Content-Type": "application/json" }, body })
+      .catch(() => {});
+  } catch {}
+}
+
+// 录音中某一路连续无声音时提醒一次；静音的音轨不会报错，只会一直没字。
+const SILENT_FRAMES_MS = 15000;
+function watchSilence(ch) {
+  if (!state.recording || ch.silentWarned) return;
+  if (ch.elapsed - (ch.heardAt ?? 0) < SILENT_FRAMES_MS) return;
+  ch.silentWarned = true;
+  const which = ch.id === "mic" ? "麦克风" : "应用";
+  clientLog("channel.silent", { channel: ch.id, elapsedMs: Math.round(ch.elapsed) });
+  toast(`${which}那一路已经 ${Math.round(ch.elapsed / 1000)} 秒没有声音。若共享的是窗口，确认声音就是那个窗口在放。`, true);
+}
+
 function onFrame(ch, frame) {
   if (!ch.origin) ch.origin = Date.now() - FRAME_MS;
   ch.elapsed += frame.length / RATE * 1000;
   const now = ch.origin + ch.elapsed;
   const level = rms(frame);
   ch.level = level;
+  if (level > 0.004) ch.heardAt = ch.elapsed;
+  else watchSilence(ch);
 
   let maxLevel = 0;
   state.channels.forEach((c) => (maxLevel = Math.max(maxLevel, c.level)));
@@ -446,6 +478,7 @@ async function start() {
     await openChannels();
     const session = await historyRequest('/api/history', { method: 'POST' });
     state.sessionId = session.id;
+    clientLog("session.start", { sessionId: session.id, channels: [...state.channels.keys()] });
   } finally {
     el.record.disabled = false;
   }
@@ -507,6 +540,7 @@ async function stop() {
   });
   const sessionId = state.sessionId;
   state.sessionId = null;
+  clientLog("session.stop", { sessionId, pending: state.pending, pendingMs: state.pendingMs });
   await teardownChannels();
   if (sessionId) historyRequest(`/api/history/${sessionId}`, { method: 'POST' })
     .catch(err => toast(`历史时长保存失败：${err.message}`, true));
@@ -709,6 +743,7 @@ function registerInput(id, stream) {
   state.inputStreams.set(id, stream);
   stream.getTracks().forEach(track => track.addEventListener("ended", () => {
     if (state.inputStreams.get(id) !== stream) return;
+    clientLog("input.ended", { channel: id, kind: track.kind });
     disableInput(id);
   }));
   syncInputs();
@@ -741,9 +776,17 @@ async function toggleInput(id) {
   button.disabled = true;
   let stream;
   try {
-    // 在任何 await 之前弹出共享请求，避免丢失用户手势。
+    // 任何 await 之前弹出共享请求，避免丢失用户手势。
+    clientLog("input.request", { channel: id });
     const pending = id === "mic" ? requestMicAudio() : requestAppAudio();
     stream = await pending;
+    clientLog("input.granted", {
+      channel: id,
+      audioTracks: stream.getAudioTracks().length,
+      videoTracks: stream.getVideoTracks().length,
+      settings: stream.getAudioTracks()[0]?.getSettings?.() || {},
+      videoLabel: stream.getVideoTracks()[0]?.label || "",
+    });
     if (!stream.getAudioTracks().length) {
       throw new Error("没有共享音频。请选择窗口并打开音频共享选项");
     }
@@ -754,6 +797,7 @@ async function toggleInput(id) {
     registerInput(id, stream);
     if (state.recording) await attachChannel(state.ctx, id, stream);
   } catch (err) {
+    clientLog("input.failed", { channel: id, name: err?.name || "", message: String(err?.message || err) });
     stream?.getTracks().forEach(t => t.stop());
     disableInput(id);
     toast(`输入未开启：${err.message || err}`, true);

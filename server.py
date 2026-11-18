@@ -157,6 +157,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
 
+        if path == "/api/log":
+            try:
+                raw = self._body()
+                event = json.loads(raw or b"{}")
+                if not isinstance(event, dict):
+                    raise ValueError("需要 JSON 对象")
+                event["source"] = "client"
+                event["time"] = round(time.time(), 3)
+                print(json.dumps(event, ensure_ascii=False)[:2000], flush=True)
+                self._send(204, b"")
+            except Exception:
+                self._send(400, {"error": "日志格式无效"})
+            return
+
         if path == "/api/history" or path.startswith("/api/history/"):
             try:
                 self._body()

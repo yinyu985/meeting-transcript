@@ -16,7 +16,9 @@ const packets=[];
 const encodeWav=frames=>frames.reduce((n,f)=>n+f.length,0);
 const send=(samples,at,dur,id,meta)=>packets.push({samples,at,dur,id,...meta});
 function render(){} function syncClear(){} function syncLabels(){} function persist(){}
+function clientLog(){} function toast(){} function attachChannel(){} function attachCaret(){} function scrollToLatest(){}
 ${extract('function createChannel(', 'async function attachChannel(')}
+${extract('function watchSilence(', 'function onFrame(')}
 ${extract('function onFrame(', '// ---------- 发送 ----------')}
 ${extract('function push(', '// ---------- 滚动 ----------')}
 function feed(ch,n,level=.1){for(let i=0;i<n;i++)onFrame(ch,new Float32Array(320).fill(level));}
@@ -50,6 +52,19 @@ feed(a,50);feed(a,50,0);feed(a,50);feed(a,100,0);feed(a,50);flush(a,a.frames.len
 `,ctx);
 assert.equal(packets[0].group,packets[1].group,'one second pause merges');
 assert.notEqual(packets[1].group,packets[2].group,'two second pause separates');
+vm.runInContext(extract('const SILENT_FRAMES_MS', 'function onFrame(') + `
+var toasted=[];function toast(m){toasted.push(m)}
+state.recording=true;
+const quiet=createChannel('remote',null);
+`,ctx);
+vm.runInContext('feed(quiet,200,0.0005)',ctx);
+assert.equal(vm.runInContext('quiet.silentWarned',ctx),false,'4 秒静音不提示');
+vm.runInContext('feed(quiet,600,0.0005)',ctx);
+assert.equal(vm.runInContext('quiet.silentWarned',ctx),true,'静音超过 15 秒提示');
+assert.equal(vm.runInContext('toasted.length',ctx),1,'只提示一次');
+vm.runInContext("const loud=createChannel('mic',null);feed(loud,900,0.2)",ctx);
+assert.equal(vm.runInContext('loud.silentWarned',ctx),false,'有声音不提示');
+console.log('PASS: silent-channel watchdog warns once only');
 vm.runInContext(`
 push('对方开头',100,{kind:'remote',group:'r'});
 push('我插话',200,{kind:'mic',group:'m'});
