@@ -34,8 +34,9 @@
 
 - 现有项目按停顿切 WAV 再请求：选 **qwen3-asr-flash**，本次整段模式中位耗时最短，且波动小。
 - 会议边说边显示字幕：推荐 **qwen-audio-3.1-asr-flash-streaming**，本次首字延迟明显更低。需要真正流式采集、服务端 WebSocket 代理与前端中间字幕渲染；只替换现有 HTTP 转写函数无法获得这个实时延迟。
-- 测速完成后已按此结论把项目切到流式：服务端 `bailian_stream.py` + 浏览器 WebSocket 上行，
-  模型 `qwen-audio-3.1-asr-flash-streaming`，见 README「工作方式」。
+- 本项目现在两路都留着，页面开关切：默认本地（`/transcribe`，LazyTyper），切到百炼走流式
+  （`bailian_stream.py` + 浏览器 WebSocket 上行，模型 `qwen-audio-3.1-asr-flash-streaming`），
+  见 README「工作方式」。
 
 ## 官方参考
 

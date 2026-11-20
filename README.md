@@ -36,7 +36,8 @@
 ## 快速开始
 
 ```bash
-git clone <this-repo> && cd meeting-transcript
+git clone https://github.com/yinyu985/meeting-transcript.git
+cd meeting-transcript
 python3 -m pip install websocket-client   # 只用本地引擎可跳过
 python3 server.py            # http://localhost:8787
 ```
@@ -62,11 +63,14 @@ python3 server.py            # http://localhost:8787
 服务端按顺序查找，浏览器永远拿不到 Key：
 
 1. 环境变量 `DASHSCOPE_API_KEY`
-2. `~/Library/Application Support/meeting-transcript/bailian.key`
-3. 项目目录 `.bailian.key`（已在 `.gitignore` 里，权限设 `chmod 600`）
+2. `~/Library/Application Support/meeting-transcript/bailian.key`（推荐，在仓库外）
+3. 项目目录 `.bailian.key`（已在 `.gitignore` 里）
 
 ```bash
-printf '%s\n' 'sk-…' > .bailian.key && chmod 600 .bailian.key
+dir="$HOME/Library/Application Support/meeting-transcript"
+mkdir -p "$dir"
+umask 077 && printf '%s\n' 'sk-…' > "$dir/bailian.key"
+chmod 600 "$dir/bailian.key"
 ```
 
 ## 两个输入是独立开关
@@ -115,6 +119,8 @@ LazyTyper 对带 `Origin` 头的请求返回 403，浏览器不能直连，转�
 两个状态，前端不用理解它的 `sentence_end` / `word.fixed` 细节。
 
 模型：`qwen-audio-3.1-asr-flash-streaming`（见 `ASR_BENCHMARK.md` 的选型对比）。
+本机实测（2026-11-20，11 秒中文合成语音、100 ms 一帧上行）：首个文字 **0.42 秒**，
+`audio_s` 与服务端收到的字节数一致。
 
 ### 断线与背压
 
@@ -166,6 +172,7 @@ index.html             页面结构与样式
 app.js                 采集、两种转写管线、草稿与定稿渲染
 recorder-worklet.js    降采样到 16k、切 20ms 帧
 history_store.py       本地 SQLite 历史
+requirements.txt       百炼引擎的 Python 依赖
 benchmark_asr.py       四个模型的测速脚本
 ASR_BENCHMARK.md        测速结果与选型理由
 ```
@@ -190,4 +197,5 @@ ASR_BENCHMARK.md        测速结果与选型理由
 
 ## 许可
 
-代码 MIT，见 `LICENSE`。转写模型由阿里云百炼提供，按百炼的计费与条款执行。
+代码 MIT，见 `LICENSE`。百炼引擎的转写模型由阿里云百炼提供，按百炼的计费与条款执行；
+本地引擎使用你本机安装的 LazyTyper 模型。
