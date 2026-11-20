@@ -1,11 +1,16 @@
-// 麦克风 / 共享应用音频 -> 独立 VAD -> 本地转写。
+// 麦克风 / 共享应用音频 -> 两个转写引擎，页面上一键切换：
+//   local   : 浏览器内 VAD 断句 -> 16k WAV -> 本机 LazyTyper
+//   bailian : 16k PCM 持续上行 -> 百炼流式识别 -> 边说边出字
 // 两个输入独立开关；按来源固定标记「我 / 对方」。
 
 const FRAME_MS = 20;
 const RATE = 16000;
 const KEY = "meeting.transcript.v5";
+const ENGINE_KEY = "meeting.engine";
+const ENGINE_LABEL = { local: "本地模型", bailian: "百炼流式" };
 
 const cfg = {
+  // 本地模式：停顿切片。
   startFrames: 3,
   hangoverMs: 700,
   prerollMs: 300,
@@ -21,6 +26,10 @@ const cfg = {
   pausePeakDecay: 0.995,
   paragraphGapMs: 1800,
   paragraphMaxMs: 60000,
+  // 百炼模式：上行与重连。
+  maxStreamBacklog: 64000, // 约 2 秒；上行拥挤时只丢音频，不阻塞采集
+  maxStartBufferMs: 30000, // 连接建立前先缓存，连上后补发，开头不丢字
+  reconnectDelayMs: 800,
 };
 
 const el = {
@@ -51,6 +60,8 @@ const el = {
 const state = {
   lines: [],          // [{ t, text, kind }]
   lang: "",
+  engine: "local",    // 'local' | 'bailian'
+  engines: {},        // /api/health 返回的可用性
   recording: false,
   stopping: false,
   ctx: null,
@@ -67,6 +78,7 @@ const state = {
   samples: [],
   rtf: 0,
   overload: false,
+  clearedAt: 0,
   stick: true,
   micEnabled: true,
   inputStreams: new Map(),
@@ -86,6 +98,79 @@ const clockOf = (t) =>
 // 身份就来自输入通道，不再猜声纹
 const whoLabel = (entry) =>
   entry.kind === "remote" ? "对方" : entry.kind === "mic" ? "我" : "未知来源";
+
+// ---------- 转写引擎选择 ----------
+// 只有两个实现，没有插件层：local 调本机 LazyTyper，bailian 走百炼流式。
+function savedEngine() {
+  const value = localStorage.getItem(ENGINE_KEY);
+  return value === "local" || value === "bailian" ? value : "";
+}
+
+function otherEngine(name) {
+  return name === "local" ? "bailian" : "local";
+}
+
+function syncEngineButtons() {
+  document.querySelectorAll("[data-engine]").forEach((b) => {
+    const name = b.dataset.engine;
+    const info = state.engines[name];
+    b.setAttribute("aria-pressed", String(name === state.engine));
+    b.disabled = state.recording;
+    b.dataset.off = info && !info.ok ? "true" : "false";
+    b.title = info
+      ? info.ok
+        ? `${ENGINE_LABEL[name]}：可用${info.model ? " · " + info.model : ""}`
+        : `${ENGINE_LABEL[name]}：不可用 · ${info.error || "未就绪"}`
+      : ENGINE_LABEL[name];
+  });
+}
+
+function applyEngine(name, opts = {}) {
+  if (state.recording) return false;
+  state.engine = name;
+  try {
+    localStorage.setItem(ENGINE_KEY, name);
+  } catch {}
+  syncEngineButtons();
+  updateProcessingStatus();
+  if (!opts.silent) toast(`转写引擎：${ENGINE_LABEL[name]}`);
+  return true;
+}
+
+async function refreshHealth() {
+  try {
+    const r = await fetch("/api/health", { cache: "no-store" });
+    const h = await r.json();
+    state.engines = h.engines || {};
+    syncEngineButtons();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 开始录音前确认引擎可用；选中的不可用而另一路可用时，这一次自动换过去。
+async function ensureEngine() {
+  await refreshHealth();
+  if (!savedEngine()) {
+    // 没存过选择：本地优先；本机模型没起来就用百炼。
+    const local = state.engines.local || {};
+    const bailian = state.engines.bailian || {};
+    state.engine = local.ok || !bailian.ok ? "local" : "bailian";
+    syncEngineButtons();
+  }
+  const info = state.engines[state.engine];
+  if (!info || info.ok) return;
+  const alt = otherEngine(state.engine);
+  if ((state.engines[alt] || {}).ok) {
+    const was = state.engine;
+    state.engine = alt;
+    syncEngineButtons();
+    toast(`${ENGINE_LABEL[was]}不可用（${info.error || "未就绪"}），本次改用${ENGINE_LABEL[alt]}`, true);
+    return;
+  }
+  throw new Error(`${ENGINE_LABEL[state.engine]}不可用：${info.error || "未就绪"}`);
+}
 
 // ---------- 渲染 ----------
 function paragraph(entry) {
@@ -116,6 +201,7 @@ function paragraph(entry) {
 function render() {
   el.paper.replaceChildren();
   for (const line of state.lines) el.paper.append(paragraph(line));
+  renderDrafts();
   if (state.recording) attachCaret();
   el.empty.style.display = state.lines.length ? "none" : "";
   el.copy.disabled = state.lines.length === 0;
@@ -155,7 +241,8 @@ addEventListener('resize', scheduleParagraphLayout);
 document.fonts?.ready.then(scheduleParagraphLayout);
 
 function syncLabels() {
-  document.body.classList.toggle("diar", state.lines.length > 0);
+  const hasDraft = [...state.channels.values()].some((ch) => ch.draft);
+  document.body.classList.toggle("diar", state.lines.length > 0 || hasDraft);
 }
 
 function attachCaret() {
@@ -174,16 +261,9 @@ function persist() {
 }
 
 function push(text, at, extra = {}) {
-  // 两路可同时讲话；只合并采集时确定的同一来源段落。
-  const previous = extra.group && state.lines.find(l => l.group === extra.group);
-  if (previous) {
-    const space = /[a-z0-9]$/i.test(previous.text) && /^[a-z0-9]/i.test(text) ? " " : "";
-    previous.text += space + text;
-    previous.end = extra.end;
-  } else {
-    state.lines.push({ t: at || Date.now(), text, ...extra });
-    state.lines.sort((a, b) => a.t - b.t);
-  }
+  // 两路可同时讲话，按定稿时间排序；同一来源的相邻句不再合并。
+  state.lines.push({ t: at || Date.now(), text, ...extra });
+  state.lines.sort((a, b) => a.t - b.t);
   render();
   el.empty.style.display = "none";
   el.copy.disabled = false;
@@ -213,24 +293,30 @@ el.stage.addEventListener("scroll", () => {
 
 el.jump.onclick = () => scrollToLatest();
 
-// ---------- 音频 -> WAV ----------
-function encodeWav(list) {
-  const n = list.reduce((a, f) => a + f.length, 0);
-  const view = new DataView(new ArrayBuffer(44 + n * 2));
-  const tag = (o, s) => [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0)));
-  tag(0, "RIFF"); view.setUint32(4, 36 + n * 2, true); tag(8, "WAVE");
-  tag(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true); view.setUint32(24, RATE, true);
-  view.setUint32(28, RATE * 2, true); view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true); tag(36, "data"); view.setUint32(40, n * 2, true);
-  let o = 44;
-  for (const f of list) {
-    for (let i = 0; i < f.length; i++, o += 2) {
-      const s = Math.max(-1, Math.min(1, f[i]));
-      view.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+// ---------- 流式草稿 ----------
+// 草稿只在屏幕上滚动更新，不写 localStorage 也不进历史；定稿后走 push()。
+function renderDrafts() {
+  el.paper.querySelectorAll("p.draft").forEach((n) => n.remove());
+  for (const ch of state.channels.values()) {
+    if (!ch.draft) {
+      ch.draftEl = null;
+      continue;
     }
+    if (!ch.draftEl) {
+      ch.draftEl = paragraph({ t: ch.draft.t, text: "", kind: ch.id });
+      ch.draftEl.classList.add("draft");
+    }
+    ch.draftEl.querySelector(".text").textContent = ch.draft.text;
+    ch.draftEl.querySelector("time").textContent = clockOf(ch.draft.t);
+    el.paper.append(ch.draftEl);
   }
-  return new Blob([view.buffer], { type: "audio/wav" });
+}
+
+function renderDraft(ch) {
+  renderDrafts();
+  syncLabels();
+  if (state.recording) attachCaret();
+  if (state.stick) scrollToLatest();
 }
 
 // ---------- 两路音频通道 ----------
@@ -239,6 +325,7 @@ function createChannel(id, stream) {
     id,
     stream,
     node: null,
+    // 本地模式（VAD 切片）
     inSpeech: false,
     frames: [],
     preroll: [],
@@ -247,13 +334,27 @@ function createChannel(id, stream) {
     noise: 0.003,
     speechPeak: 0,
     segAt: 0,
-    level: 0,
-    origin: 0,
-    elapsed: 0,
     group: null,
     groupAt: 0,
     lastVoiceEnd: -Infinity,
+    // 百炼模式（流式上行）
+    ws: null,
+    queue: [],
+    streaming: false,
+    streamReady: false,
+    streamError: null,
+    reconnecting: false,
+    streamDone: false,
+    stopped: false,
+    onStreamDone: null,
+    draft: null,
+    draftEl: null,
+    dropped: 0,
+    // 共用
+    level: 0,
     levelAt: 0,
+    origin: 0,
+    elapsed: 0,
   };
 }
 
@@ -278,6 +379,8 @@ async function attachChannel(ctx, id, stream) {
   mute.gain.value = 0;
   node.connect(mute).connect(ctx.destination);
   state.channels.set(id, ch);
+  // 录音中新增输入（例如中途打开应用声音）立刻接入流式上行。
+  if (state.recording && state.engine === "bailian") runStream(ch);
 
   // 输入流的 ended 事件由 registerInput() 统一收尾。
   return ch;
@@ -335,11 +438,15 @@ setInterval(updateMeters, 100);
 function onFrame(ch, frame) {
   if (!ch.origin) ch.origin = Date.now() - FRAME_MS;
   ch.elapsed += frame.length / RATE * 1000;
-  const now = ch.origin + ch.elapsed;
-  const level = rms(frame);
-  ch.level = level;
+  ch.level = rms(frame);
   ch.levelAt = Date.now();
+  if (state.engine === "bailian") feedFrame(ch, frame);
+  else vadFrame(ch, frame, ch.origin + ch.elapsed);
+}
 
+// ---------- 本地模式：浏览器内 VAD 断句 -> WAV -> /transcribe ----------
+function vadFrame(ch, frame, now) {
+  const level = ch.level;
   const thr = Math.max(0.006, ch.noise * 2.5);
 
   if (!ch.inSpeech) {
@@ -380,6 +487,25 @@ function onFrame(ch, frame) {
   else if (ms >= cfg.segmentFloorMs && pause >= requiredPause) flush(ch, ms, "pause");
 }
 
+function encodeWav(list) {
+  const n = list.reduce((a, f) => a + f.length, 0);
+  const view = new DataView(new ArrayBuffer(44 + n * 2));
+  const tag = (o, s) => [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0)));
+  tag(0, "RIFF"); view.setUint32(4, 36 + n * 2, true); tag(8, "WAVE");
+  tag(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true); view.setUint32(24, RATE, true);
+  view.setUint32(28, RATE * 2, true); view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true); tag(36, "data"); view.setUint32(40, n * 2, true);
+  let o = 44;
+  for (const f of list) {
+    for (let i = 0; i < f.length; i++, o += 2) {
+      const s = Math.max(-1, Math.min(1, f[i]));
+      view.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+  }
+  return new Blob([view.buffer], { type: "audio/wav" });
+}
+
 function flush(ch, ms, reason = "stop") {
   const captured = ch.frames;
   if (!captured.length) return;
@@ -394,28 +520,21 @@ function flush(ch, ms, reason = "stop") {
   send(encodeWav(captured), at, ms, ch.id, meta);
 }
 
-// ---------- 性能与背压：观测实际请求，不假定模型支持高效并发 ----------
-function updateProcessingStatus() {
-  const backlog = state.pending ? ` · 待转写 ${Math.ceil(state.pendingMs / 1000)} 秒` : "";
-  if (!state.recording) {
-    el.stateText.textContent = state.pending ? `正在完成转写${backlog}` : (state.lines.length ? "已停止" : "待机");
-  } else {
-    el.stateText.textContent = `录音中${state.channels.size ? "" : " · 无输入"}${backlog}`;
-  }
-  el.stateText.title = "停顿切片：2 秒后寻找 240ms 停顿，10 秒后 200ms，20 秒后 160ms，此后不再缩短；无停顿不强切。少量请求依次处理，积压时两路可同时转写；待转写不是预计等待时间";
+// 停止或关掉一路时，把还没到切片条件的声音也交出去。
+function flushTail() {
+  state.channels.forEach((ch) => {
+    // 如果按停止时刚开口，还未满足连续三帧，也保留这段候选声音。
+    if (!ch.inSpeech && ch.above > 0 && ch.preroll.length) {
+      ch.frames = ch.preroll;
+      ch.segAt = ch.origin + ch.elapsed - ch.frames.reduce((n, f) => n + f.length, 0) / RATE * 1000;
+      ch.group = crypto.randomUUID();
+    }
+    if (ch.frames.length) flush(ch, ch.frames.reduce((n, f) => n + f.length, 0) / RATE * 1000, "stop");
+    ch.inSpeech = false;
+  });
 }
 
-function observePerformance(durationMs, elapsedMs) {
-  state.samples.push({ durationMs, elapsedMs });
-  if (state.samples.length > 16) state.samples.shift();
-  // 只记录实际 RTF 供状态栏与日志使用；切片位置由停顿决定，不再按耗时改窗口。
-  if (state.samples.length < 4) return;
-  const recent = state.samples.slice(1);
-  state.rtf = recent.reduce((n, s) => n + s.elapsedMs, 0) /
-    recent.reduce((n, s) => n + s.durationMs, 0);
-}
-
-// ---------- 发送 ----------
+// ---------- 本地模式：发送与背压 ----------
 function send(blob, at, dur, chanId, meta = {}) {
   const generation = state.generation;
   const sessionId = state.sessionId;
@@ -430,7 +549,7 @@ function send(blob, at, dur, chanId, meta = {}) {
     state.overload = true;
     queueMicrotask(async () => {
       if (state.recording) await stop();
-      toast("待转写音频超过两分钟，已停止采集；正在处理已录内容。请使用更快的模型后再开始。", true);
+      toast("待转写音频超过两分钟，已停止采集；正在处理已录内容。本地模型太慢时改用百炼。", true);
     });
   }
   console.info("audio.segment", { id, chanId, at, dur, ...meta });
@@ -467,7 +586,7 @@ function send(blob, at, dur, chanId, meta = {}) {
       if (generation === state.generation) push(text, at, { kind: chanId, ...meta });
     } catch (err) {
       console.error("audio.segment.failed", { id, chanId, error: String(err) });
-      toast(`转写失败（${chanId} ${clockOf(at)}）：${err.message || err}`, true);
+      toast(`转写失败（${whoLabel({ kind: chanId })} ${clockOf(at)}）：${err.message || err}`, true);
     } finally {
       clearTimeout(timeout);
       state.pending--;
@@ -482,6 +601,16 @@ function send(blob, at, dur, chanId, meta = {}) {
   // 新积压可以唤醒另一输入，不必等当前请求结束。
   pumpRequestSlots();
   return task;
+}
+
+function observePerformance(durationMs, elapsedMs) {
+  state.samples.push({ durationMs, elapsedMs });
+  if (state.samples.length > 16) state.samples.shift();
+  // 只记录实际 RTF 供状态栏与日志使用；切片位置由停顿决定。
+  if (state.samples.length < 4) return;
+  const recent = state.samples.slice(1);
+  state.rtf = recent.reduce((n, s) => n + s.elapsedMs, 0) /
+    recent.reduce((n, s) => n + s.durationMs, 0);
 }
 
 function acquireRequestSlot() {
@@ -500,20 +629,225 @@ function pumpRequestSlots() {
   }
 }
 
+// ---------- 百炼模式：上行 16k PCM ----------
+function sendPcm(ws, frame) {
+  const pcm = new Int16Array(frame.length);
+  for (let i = 0; i < frame.length; i++) {
+    const s = Math.max(-1, Math.min(1, frame[i]));
+    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  ws.send(pcm.buffer);
+}
+
+function feedFrame(ch, frame) {
+  const ws = ch.ws;
+  // 连接还没建立（首次连接或重连）：先缓存，连上后补发，开头不丢字。
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    ch.queue.push(frame);
+    if (ch.queue.length > cfg.maxStartBufferMs / FRAME_MS) {
+      ch.queue.shift();
+      ch.dropped++;
+    }
+    return;
+  }
+  drainQueue(ch);
+  // AudioWorklet 不能暂停；上行拥堵时丢音频，保证采集与电平表继续走。
+  if (ws.bufferedAmount > cfg.maxStreamBacklog) {
+    ch.dropped++;
+    return;
+  }
+  sendPcm(ws, frame);
+}
+
+function drainQueue(ch) {
+  const ws = ch.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !ch.queue.length) return;
+  const pending = ch.queue;
+  ch.queue = [];
+  for (const frame of pending) {
+    if (ws.bufferedAmount > cfg.maxStreamBacklog) {
+      ch.dropped++;
+      continue;
+    }
+    sendPcm(ws, frame);
+  }
+}
+
+function onStreamEvent(ch, ev) {
+  if (ev.type === "error") {
+    console.error("stream.error", { channel: ch.id, error: ev.error });
+    ch.streamError = ev.error;
+    toast(`转写失败（${whoLabel({ kind: ch.id })}）：${ev.error}`, true);
+    return;
+  }
+  if (ev.type === "warning") {
+    toast(ev.error, true);
+    return;
+  }
+  if (ev.type === "ready") {
+    ch.streamReady = true;
+    ch.streamError = null;
+    updateProcessingStatus();
+    return;
+  }
+  if (ev.type === "done") {
+    ch.streamDone = true;
+    ch.onStreamDone?.();
+    return;
+  }
+  if (ev.type === "reconnecting") {
+    // 上游断连由服务端重建，会议不中断；这一句的草稿随旧任务作废。
+    ch.reconnecting = true;
+    ch.draft = null;
+    renderDraft(ch);
+    updateProcessingStatus();
+    return;
+  }
+  if (ev.type === "reconnected") {
+    ch.reconnecting = false;
+    updateProcessingStatus();
+    return;
+  }
+  const text = (ev.text || "").trim();
+  if (!text) return;
+  const at = Number(ev.at) || Date.now();
+  if (at < state.clearedAt) return;
+  if (ev.type === "draft") {
+    ch.draft = { t: at, text };
+    renderDraft(ch);
+    return;
+  }
+  const ms = Math.max(0, Number(ev.ms) || 0);
+  ch.draft = null;
+  // 服务端按静音断句；每个定稿句独立成段，长段落交给排版自动加宽。
+  push(text, at, { kind: ch.id, end: at + ms });
+  renderDraft(ch);
+}
+
+// 一路音频 = 一条长连接；断线自动重连，不丢接下来的说话。
+function runStream(ch) {
+  if (state.engine !== "bailian" || ch.streaming) return;
+  ch.streaming = true;
+  let attempts = 0;
+  let opened = false;
+
+  const open = () => {
+    if (!state.recording || state.engine !== "bailian" || state.channels.get(ch.id) !== ch) {
+      ch.streaming = false;
+      return;
+    }
+    const query = new URLSearchParams({
+      channel: ch.id,
+      session: state.sessionId || "",
+      lang: state.lang || "",
+    });
+    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${scheme}//${location.host}/api/stream?${query}`);
+    socket.binaryType = "arraybuffer";
+    ch.ws = socket;
+    ch.streamReady = false;
+    ch.streamError = null;
+
+    socket.onopen = () => {
+      attempts = 0;
+      opened = true;
+      // 握手期间的音频在这里补发。
+      drainQueue(ch);
+    };
+    socket.onmessage = (event) => {
+      if (typeof event.data !== "string") return;
+      try {
+        onStreamEvent(ch, JSON.parse(event.data));
+      } catch {}
+    };
+    socket.onerror = () => {
+      ch.streamError = ch.streamError || "连接错误";
+    };
+    socket.onclose = () => {
+      ch.ws = null;
+      ch.streamReady = false;
+      ch.reconnecting = false;
+      ch.onStreamDone?.();
+      // 已经推上行过的音频不重放，只保留“连接没建立起来”那段。
+      if (opened) ch.queue = [];
+      if (!state.recording || state.channels.get(ch.id) !== ch || ch.stopped) {
+        ch.streaming = false;
+        return;
+      }
+      attempts++;
+      if (attempts > 5) {
+        ch.streaming = false;
+        toast(`转写连接连续失败，已停止重连（${whoLabel({ kind: ch.id })}）。点「停止」再「开始」可重试。`, true);
+        return;
+      }
+      if (ch.streamError) {
+        toast(`转写连接断开（${whoLabel({ kind: ch.id })}）：${ch.streamError}，正在重连…`, true);
+      }
+      setTimeout(open, cfg.reconnectDelayMs * attempts);
+    };
+  };
+
+  open();
+}
+
+function openStreams() {
+  for (const ch of state.channels.values()) runStream(ch);
+}
+
+// 停止时先让服务端把最后一句断完：发 stop，等 done，再关闭。
+function closeStream(ch) {
+  const socket = ch.ws;
+  if (!socket) return;
+  try {
+    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" }));
+  } catch {}
+  ch.stopped = true;
+}
+
+function updateProcessingStatus() {
+  if (state.engine === "bailian") {
+    const live = [...state.channels.values()].filter((ch) => ch.streamReady).length;
+    const reconnecting = [...state.channels.values()].some((ch) => ch.reconnecting);
+    const dropped = [...state.channels.values()].reduce((n, ch) => n + ch.dropped, 0);
+    const warn = dropped ? ` · 丢帧 ${dropped}` : "";
+    if (!state.recording) {
+      el.stateText.textContent = state.lines.length ? "已停止" : "待机";
+    } else {
+      el.stateText.textContent = reconnecting
+        ? `转写线路重连中${state.channels.size > 1 ? " · 另一路继续" : ""}`
+        : `流式转写中${state.channels.size ? "" : " · 无输入"}${
+          state.channels.size ? ` · ${live} 路在线` : ""}${warn}`;
+    }
+    el.stateText.title = "百炼流式：音频以 20ms 帧实时上行，边说边出字；断线会自动重连。上行拥堵超过约两秒时丢弃新音频以保证采集不中断";
+    return;
+  }
+  const backlog = state.pending ? ` · 待转写 ${Math.ceil(state.pendingMs / 1000)} 秒` : "";
+  if (!state.recording) {
+    el.stateText.textContent = state.pending ? `正在完成转写${backlog}` : (state.lines.length ? "已停止" : "待机");
+  } else {
+    el.stateText.textContent = `录音中${state.channels.size ? "" : " · 无输入"}${backlog}`;
+  }
+  el.stateText.title = "本地模型：停顿切片（2 秒后 240ms、10 秒后 200ms、20 秒后 160ms，无停顿不强切）；少量请求依次处理，积压时两路可同时转写；待转写不是预计等待时间";
+}
+
+setInterval(updateProcessingStatus, 1000);
+
 // ---------- 生命周期 ----------
 async function start() {
-  if (state.overload && state.pending) {
+  if (state.engine === "local" && state.overload && state.pending) {
     toast("请等积压转写完成后再开始", true);
     return;
   }
   state.overload = false;
+  // 每次开始前重新探测：LazyTyper 可能刚启动，百炼 Key 也可能刚放好。
+  await ensureEngine();
   el.record.disabled = true;
   el.stateText.textContent = "开启中…";
   try {
     await openChannels();
     const session = await historyRequest('/api/history', { method: 'POST' });
     state.sessionId = session.id;
-    clientLog("session.start", { sessionId: session.id, channels: [...state.channels.keys()] });
+    clientLog("session.start", { sessionId: session.id, engine: state.engine, channels: [...state.channels.keys()] });
   } finally {
     el.record.disabled = false;
   }
@@ -525,10 +859,12 @@ async function start() {
 
   document.body.classList.add("rec");
   el.record.lastChild.textContent = "停止";
+  syncEngineButtons();
   syncInputs();
   el.empty.style.display = "none";
   attachCaret();
   scrollToLatest(true);
+  if (state.engine === "bailian") openStreams();
 }
 
 async function openChannels() {
@@ -554,6 +890,7 @@ async function stop() {
   el.record.disabled = true;
   el.micInput.disabled = el.appInput.disabled = true;
   el.stateText.textContent = "正在提交尾段…";
+  // 先让 AudioWorklet 把缓存里的半帧交出来，再关上行，尾音才不会被截断。
   await Promise.all([...state.channels.values()].map(ch => new Promise(resolve => {
     const timeout = setTimeout(() => {
       ch.onDrained = null;
@@ -563,24 +900,27 @@ async function stop() {
     ch.onDrained = () => { clearTimeout(timeout); ch.onDrained = null; resolve(); };
     ch.node.port.postMessage({ type: "drain" });
   })));
-  state.channels.forEach((ch) => {
-    // 如果按停止时刚开口，还未满足连续三帧，也保留这段候选声音。
-    if (!ch.inSpeech && ch.above > 0 && ch.preroll.length) {
-      ch.frames = ch.preroll;
-      ch.segAt = ch.origin + ch.elapsed - ch.frames.reduce((n, f) => n + f.length, 0) / RATE * 1000;
-      ch.group = crypto.randomUUID();
-    }
-    if (ch.frames.length) flush(ch, ch.frames.reduce((n, f) => n + f.length, 0) / RATE * 1000, "stop");
-    ch.inSpeech = false;
-  });
+  // 本地模式：把没到切片条件的声音也交出去；百炼模式：交给服务端断最后一句。
+  if (state.engine === "local") flushTail();
   const sessionId = state.sessionId;
   state.sessionId = null;
-  clientLog("session.stop", { sessionId, pending: state.pending, pendingMs: state.pendingMs });
+  state.recording = false;
+  clientLog("session.stop", { sessionId, engine: state.engine, pending: state.pending, pendingMs: state.pendingMs });
+  // 关闭上行后，服务端会做最后一次断句并回传定稿；等它把 done 发完。
+  const waits = state.engine === "bailian" ? [...state.channels.values()].map(ch => {
+    if (!ch.ws) return Promise.resolve();
+    const done = new Promise(resolve => {
+      ch.onStreamDone = resolve;
+      setTimeout(resolve, 20000);
+    });
+    closeStream(ch);
+    return done;
+  }) : [];
+  await Promise.all(waits);
   await teardownChannels();
   if (sessionId) historyRequest(`/api/history/${sessionId}`, { method: 'POST' })
     .catch(err => toast(`历史时长保存失败：${err.message}`, true));
 
-  state.recording = false;
   clearInterval(state.tick);
   state.tick = null;
 
@@ -594,14 +934,19 @@ async function stop() {
   state.stopping = false;
   el.record.disabled = false;
   el.micInput.disabled = el.appInput.disabled = false;
+  syncEngineButtons();
 }
 
 async function teardownChannels() {
   state.channels.forEach((ch) => {
+    try { ch.ws?.close(); } catch {}
+    ch.ws = null;
+    ch.queue = [];
     ch.node?.port.close();
     ch.node?.disconnect();
   });
   state.channels.clear();
+  render();
   state.inputStreams.forEach(stream => stream.getTracks().forEach(t => t.stop()));
   state.inputStreams.clear();
   state.sessionDuo = false;
@@ -688,8 +1033,11 @@ function syncClear() {
 }
 
 function doClear() {
+  // 清空后，已在上行途中的旧句子不再回填；草稿一并丢弃。
   state.generation++;
+  state.clearedAt = Date.now();
   state.lines = [];
+  for (const ch of state.channels.values()) ch.draft = null;
   try {
     localStorage.removeItem(KEY);
   } catch {}
@@ -787,10 +1135,18 @@ function registerInput(id, stream) {
 function disableInput(id) {
   const ch = state.channels.get(id);
   if (ch) {
-    if (ch.inSpeech) flush(ch, ch.frames.length * FRAME_MS);
+    // 本地模式：先把已经录下的半句交出去，别因为关掉这一路丢掉尾音。
+    if (state.engine === "local") {
+      if (ch.inSpeech) flush(ch, ch.frames.length * FRAME_MS);
+    } else {
+      closeStream(ch);
+    }
+    ch.draft = null;
     ch.node.port.close();
     ch.node.disconnect();
     state.channels.delete(id);
+    if (ch.draftEl) ch.draftEl.remove();
+    ch.draftEl = null;
   }
   const stream = state.inputStreams.get(id);
   state.inputStreams.delete(id);
@@ -845,6 +1201,11 @@ async function toggleInput(id) {
 el.micInput.onclick = () => toggleInput("mic");
 el.appInput.onclick = () => toggleInput("remote");
 
+// ---------- 引擎切换 ----------
+document.querySelectorAll("[data-engine]").forEach((b) => {
+  b.onclick = () => applyEngine(b.dataset.engine);
+});
+
 // ---------- 语言 ----------
 document.querySelectorAll(".seg[role='group'] [data-lang]").forEach((b) => {
   b.onclick = () => {
@@ -888,18 +1249,31 @@ try {
   state.micEnabled = localStorage.getItem("meeting.micEnabled") !== "0";
 } catch {}
 
+// 引擎选择先按上次的选择；没存过就本地优先，开始录音时再探测一次。
+state.engine = savedEngine() || "local";
+syncEngineButtons();
+
 syncInputs();
 render();
 if (state.lines.length) requestAnimationFrame(() => scrollToLatest(true));
 
-// ---------- 后端能力探测 ----------
-fetch("/api/health")
-  .then((r) => r.json())
-  .then((h) => {
-    const lt = h.lazytyper || {};
-    if (!lt.ok) toast(`LazyTyper 未就绪：${lt.error || "启动 App 后刷新页面"}`, true);
-  })
-  .catch(() => toast("代理不可用", true));
+// ---------- 后端能力探测：两路引擎各自报可用性 ----------
+refreshHealth().then((ok) => {
+  if (!ok) {
+    toast("代理不可用", true);
+    return;
+  }
+  clientLog("engine.health", { engine: state.engine, ...state.engines });
+  const info = state.engines[state.engine];
+  if (!info || info.ok) return;
+  const alt = otherEngine(state.engine);
+  const altOk = (state.engines[alt] || {}).ok;
+  toast(
+    `${ENGINE_LABEL[state.engine]}未就绪：${info.error || "未知原因"}` +
+    (altOk ? `；开始录音时会改用${ENGINE_LABEL[alt]}` : "。页面仍可录音，但不会有字幕。"),
+    true
+  );
+});
 
 if (!navigator.mediaDevices?.getUserMedia) {
   toast("这个页面不是安全上下文，拿不到麦克风。用 http://localhost:8787 打开。", true);
